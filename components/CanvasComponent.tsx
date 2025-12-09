@@ -1,11 +1,10 @@
 import React, { useEffect, useRef, useCallback } from 'react';
-import fabric from 'fabric';
 import * as Y from 'yjs';
 import { WebrtcProvider } from 'y-webrtc';
-import { useAppSelector, useAppDispatch } from '@/lib/store/hooks';
-import { setCanvasData, setCanvasId, setLastSaved } from '@/lib/store/canvasSlice';
+import { useAppSelector } from '@/lib/store/hooks';
 import type { Tool } from '@/lib/store/types';
 import type { RootState } from '@/lib/store/store';
+import type { Canvas, Object } from 'fabric';
 import {
   createShape,
   updateShape,
@@ -14,6 +13,13 @@ import {
   isShapeTool,
   isDrawingTool,
 } from '@/lib/drawUtils';
+import {
+  syncObjectToYjs,
+  removeObjectFromYjs,
+  applyYjsUpdateToFabric,
+  syncAllObjectsToYjs,
+  ensureObjectId,
+} from '@/lib/yjsSync';
 
 interface CanvasComponentProps {
   width: number;
@@ -21,14 +27,12 @@ interface CanvasComponentProps {
 }
 
 const CanvasComponent: React.FC<CanvasComponentProps> = ({ width, height }) => {
-  const dispatch = useAppDispatch();
-  const { activeTool, color, brushWidth, canvasData, canvasId } = useAppSelector((state: RootState) => state.canvas);
+  const { activeTool, color, brushWidth, canvasData } = useAppSelector((state: RootState) => state.canvas);
   
-  const canvasRef = useRef<fabric.Canvas>(null);
+  const canvasRef = useRef<Canvas | null>(null);
   const isDrawing = useRef(false);
   const startPoint = useRef<{ x: number; y: number } | null>(null);
-  const currentShape = useRef<fabric.Object | null>(null);
-  const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const currentShape = useRef<Object | null>(null);
   const isInitializedRef = useRef(false);
   
   // Yjs refs for real-time collaboration
@@ -36,6 +40,7 @@ const CanvasComponent: React.FC<CanvasComponentProps> = ({ width, height }) => {
   const objectsMapRef = useRef<Y.Map<any> | null>(null);
   const providerRef = useRef<WebrtcProvider | null>(null);
   const isApplyingRemoteUpdateRef = useRef(false);
+  const fabricUtilRef = useRef<any>(null);
 
   // Refs to access latest Redux state in event handlers without re-creating handlers
   const activeToolRef = useRef<Tool>(activeTool);
@@ -54,92 +59,21 @@ const CanvasComponent: React.FC<CanvasComponentProps> = ({ width, height }) => {
     brushWidthRef.current = brushWidth;
   }, [brushWidth]);
 
-
   /**
-   * Generates a unique ID for Fabric objects
+   * Wrapper to sync object to Yjs (uses utility function)
    */
-  const generateObjectId = useCallback((): string => {
-    return `obj_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const handleSyncObjectToYjs = useCallback((obj: Object): void => {
+    syncObjectToYjs(obj, objectsMapRef.current, isApplyingRemoteUpdateRef.current);
   }, []);
 
   /**
-   * Ensures an object has a unique ID
+   * Wrapper to remove object from Yjs (uses utility function)
    */
-  const ensureObjectId = useCallback((obj: fabric.Object): void => {
-    const objWithData = obj as any;
-    if (!objWithData.data || !objWithData.data.id) {
-      if (!objWithData.data) {
-        objWithData.data = {};
-      }
-      objWithData.data.id = generateObjectId();
-    }
-  }, [generateObjectId]);
-
-  /**
-   * Syncs a Fabric object to Yjs objectsMap
-   */
-  const syncObjectToYjs = useCallback((obj: fabric.Object): void => {
-    if (isApplyingRemoteUpdateRef.current || !objectsMapRef.current) return;
-    
-    try {
-      ensureObjectId(obj);
-      const objWithData = obj as any;
-      const objectId = objWithData.data.id;
-      const objectJson = obj.toJSON();
-      
-      // Store the object in Yjs map
-      objectsMapRef.current.set(objectId, objectJson);
-    } catch (error) {
-      console.error('Error syncing object to Yjs:', error);
-    }
-  }, [ensureObjectId]);
-
-  /**
-   * Removes an object from Yjs objectsMap
-   */
-  const removeObjectFromYjs = useCallback((obj: fabric.Object): void => {
-    if (isApplyingRemoteUpdateRef.current || !objectsMapRef.current) return;
-    
-    try {
-      const objWithData = obj as any;
-      if (objWithData.data && objWithData.data.id) {
-        objectsMapRef.current.delete(objWithData.data.id);
-      }
-    } catch (error) {
-      console.error('Error removing object from Yjs:', error);
-    }
+  const handleRemoveObjectFromYjs = useCallback((obj: Object): void => {
+    removeObjectFromYjs(obj, objectsMapRef.current, isApplyingRemoteUpdateRef.current);
   }, []);
 
-  const serializeCanvas = useCallback((canvas: fabric.Canvas) => {
-    try {
-      const json = JSON.stringify(canvas.toJSON());
-      dispatch(setCanvasData(json));
-      
-      // Generate canvas ID if it doesn't exist
-      if (!canvasId) {
-        const newId = `canvas_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-        dispatch(setCanvasId(newId));
-      }
-      
-      // Debounced save (for future DB implementation)
-      if (saveTimeoutRef.current) {
-        clearTimeout(saveTimeoutRef.current);
-      }
-      
-      saveTimeoutRef.current = setTimeout(() => {
-       
-        dispatch(setLastSaved(new Date().toISOString()));
-        console.log('Canvas state saved to Redux:', {
-          id: canvasId || 'new',
-          dataLength: json.length,
-        });
-      }, 2000); // 2 second debounce
-    } catch (error) {
-      console.error('Error serializing canvas:', error);
-    }
-  }, [dispatch, canvasId]);
-
-  const setupEventListeners = useCallback((canvas: fabric.Canvas, fabric: any) => {
+  const setupEventListeners = useCallback((canvas: Canvas, fabric: any) => {
     // Mouse down event
     canvas.on('mouse:down', (options) => {
       if (!options.pointer) return;
@@ -163,7 +97,7 @@ const CanvasComponent: React.FC<CanvasComponentProps> = ({ width, height }) => {
           currentShape.current = shape;
           canvas.add(shape);
           // Sync to Yjs immediately when shape is added
-          syncObjectToYjs(shape);
+          handleSyncObjectToYjs(shape);
         }
       }
     });
@@ -203,33 +137,30 @@ const CanvasComponent: React.FC<CanvasComponentProps> = ({ width, height }) => {
       }
     });
 
-    // Listen to canvas changes to update Redux state and Yjs
+    // Listen to canvas changes to sync to Yjs
     // When an object is added (pencil drawing, shapes)
     canvas.on('object:added', (e) => {
       const obj = e.target;
       if (obj) {
         ensureObjectId(obj);
-        syncObjectToYjs(obj);
+        handleSyncObjectToYjs(obj);
       }
-      serializeCanvas(canvas);
     });
 
     // When an object is modified (moved, resized, etc.)
     canvas.on('object:modified', (e) => {
       const obj = e.target;
       if (obj) {
-        syncObjectToYjs(obj);
+        handleSyncObjectToYjs(obj);
       }
-      serializeCanvas(canvas);
     });
 
     // When an object is removed (deleted)
     canvas.on('object:removed', (e) => {
       const obj = e.target;
       if (obj) {
-        removeObjectFromYjs(obj);
+        handleRemoveObjectFromYjs(obj);
       }
-      serializeCanvas(canvas);
     });
 
     // When a path is created (for pencil/eraser drawing)
@@ -237,13 +168,12 @@ const CanvasComponent: React.FC<CanvasComponentProps> = ({ width, height }) => {
       const path = e.path;
       if (path) {
         ensureObjectId(path);
-        syncObjectToYjs(path);
+        handleSyncObjectToYjs(path);
       }
-      serializeCanvas(canvas);
     });
 
     // Note: object:modified already covers moved, scaled, rotated, etc.
-  }, [serializeCanvas, ensureObjectId, syncObjectToYjs, removeObjectFromYjs]);
+  }, [handleSyncObjectToYjs, handleRemoveObjectFromYjs]);
 
   // Handle tool change via Redux state
   useEffect(() => {
@@ -262,12 +192,12 @@ const CanvasComponent: React.FC<CanvasComponentProps> = ({ width, height }) => {
       
       if (tool === 'select') {
         canvasRef.current.selection = true;
-        canvasRef.current.forEachObject((obj: fabric.Object) => {
+        canvasRef.current.forEachObject((obj: Object) => {
           obj.selectable = true;
         });
       } else {
         canvasRef.current.selection = false;
-        canvasRef.current.forEachObject((obj: fabric.Object) => {
+        canvasRef.current.forEachObject((obj: Object) => {
           obj.selectable = false;
         });
       }
@@ -278,6 +208,17 @@ const CanvasComponent: React.FC<CanvasComponentProps> = ({ width, height }) => {
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
+    // Pre-load fabric util for enlivenObjects
+    import('fabric').then((fabricModule) => {
+      fabricUtilRef.current = (fabricModule as any).util;
+    });
+
+    // Get room ID from URL query parameter, default to 'default' if not provided
+    const urlParams = new URLSearchParams(window.location.search);
+    const roomId = urlParams.get('room') || 'default';
+    
+    console.log(`[WebRTC] Initializing with room: ${roomId}`);
+
     // Create Y.Doc for shared canvas state
     const ydoc = new Y.Doc();
     ydocRef.current = ydoc;
@@ -286,79 +227,56 @@ const CanvasComponent: React.FC<CanvasComponentProps> = ({ width, height }) => {
     const objectsMap = ydoc.getMap('objects');
     objectsMapRef.current = objectsMap;
 
-    // Create WebRTC provider for P2P syncing (zero server cost)
-    // Using a fixed room name for global shared canvas
-    const provider = new WebrtcProvider('crazy-draw-global-canvas', ydoc, {
-      signaling: ['wss://signaling.yjs.dev', 'wss://y-webrtc-signaling-eu.herokuapp.com', 'wss://y-webrtc-signaling-us.herokuapp.com'],
+    // Create WebRTC provider for P2P syncing using local signaling server only
+    const localSignalingUrl = `ws://localhost:4444?room=${roomId}`;
+    const provider = new WebrtcProvider(roomId, ydoc, {
+      signaling: [localSignalingUrl],
     });
     providerRef.current = provider;
 
-    console.log('Yjs initialized with WebRTC provider');
+    console.log(`[WebRTC] Provider initialized with local signaling server: ${localSignalingUrl}`);
+
+    // Log provider status changes
+    provider.on('status', (event: { connected: boolean }) => {
+      console.log(`[WebRTC] Provider status: ${event.connected ? 'connected' : 'disconnected'}`);
+    });
+
+    // Log connected peers count using awareness API
+    const awareness = provider.awareness;
+    const updatePeerCount = () => {
+      const peers = Array.from(awareness.getStates().keys());
+      console.log(`[WebRTC] Connected peers: ${peers.length}`);
+    };
+
+    // Initial peer count
+    updatePeerCount();
+
+    // Listen for awareness changes (peers joining/leaving)
+    awareness.on('change', () => {
+      updatePeerCount();
+    });
 
     // Listen to remote updates from Yjs
-    objectsMap.observe((event: Y.YMapEvent<any>) => {
-      if (!canvasRef.current || isApplyingRemoteUpdateRef.current) return;
+    objectsMap.observe(async (event: Y.YMapEvent<any>) => {
+      if (!canvasRef.current) return;
 
-      const canvas = canvasRef.current;
-      isApplyingRemoteUpdateRef.current = true;
-
-      try {
-        event.keysChanged.forEach((objectId) => {
-          const objectJson = objectsMap.get(objectId);
-          
-          if (objectJson) {
-            // Check if object already exists in canvas
-            let existingObj: fabric.Object | null = null;
-            canvas.forEachObject((obj: fabric.Object) => {
-              const objWithData = obj as any;
-              if (objWithData.data && objWithData.data.id === objectId) {
-                existingObj = obj;
-              }
-            });
-
-            if (existingObj) {
-              // Update existing object
-              (existingObj as any).set(objectJson as any);
-              (existingObj as any).setCoords();
-            } else {
-              // Add new object
-              fabric.util.enlivenObjects([objectJson]).then((objects: any[]) => {
-                objects.forEach((obj: any) => {
-                  if (obj && typeof obj.set === 'function') {
-                    // Only add Fabric objects, not filters/shadows/etc
-                    const objWithData = obj as any;
-                    if (!objWithData.data) objWithData.data = {};
-                    objWithData.data.id = objectId;
-                    canvas.add(obj);
-                  }
-                });
-                canvas.renderAll();
-              });
-            }
-          } else {
-            // Object was deleted
-            canvas.forEachObject((obj: fabric.Object) => {
-              const objWithData = obj as any;
-              if (objWithData.data && objWithData.data.id === objectId) {
-                canvas.remove(obj);
-              }
-            });
-            canvas.renderAll();
-          }
-        });
-      } catch (error) {
-        console.error('Error applying remote Yjs update:', error);
-      } finally {
-        isApplyingRemoteUpdateRef.current = false;
-      }
+      await applyYjsUpdateToFabric(
+        event,
+        objectsMap,
+        canvasRef.current,
+        fabricUtilRef.current,
+        isApplyingRemoteUpdateRef
+      );
     });
 
     return () => {
+      console.log(`[WebRTC] Cleaning up provider for room: ${roomId}`);
       provider.destroy();
       ydoc.destroy();
       providerRef.current = null;
       objectsMapRef.current = null;
       ydocRef.current = null;
+      fabricUtilRef.current = null;
     };
   }, []);
 
@@ -366,7 +284,7 @@ const CanvasComponent: React.FC<CanvasComponentProps> = ({ width, height }) => {
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
-    let canvas: fabric.Canvas | null = null;
+    let canvas: Canvas | null = null;
     let isMounted = true;
 
     const handleResize = () => {
@@ -377,7 +295,7 @@ const CanvasComponent: React.FC<CanvasComponentProps> = ({ width, height }) => {
 
     const init = async () => {
       const fabricModule = await import('fabric');
-      const fabric = (fabricModule as any).fabric || fabricModule;
+      const fabric = fabricModule as any;
 
       if (!isMounted) return;
 
@@ -400,18 +318,19 @@ const CanvasComponent: React.FC<CanvasComponentProps> = ({ width, height }) => {
       setupEventListeners(canvas!, fabric);
 
       // Load canvas data from Redux if available (only on initial mount)
+      // Note: This is for initial load only. After that, Yjs handles all syncing
       if (initialCanvasData && !isInitializedRef.current && canvas) {
         try {
           canvas.loadFromJSON(initialCanvasData, () => {
             if (canvas) {
               // Ensure all loaded objects have IDs
-              canvas.forEachObject((obj: fabric.Object) => {
+              canvas.forEachObject((obj: Object) => {
                 ensureObjectId(obj);
-                // Sync existing objects to Yjs
-                if (objectsMapRef.current) {
-                  syncObjectToYjs(obj);
-                }
               });
+              // Sync all existing objects to Yjs (only if not applying remote update)
+              if (objectsMapRef.current) {
+                syncAllObjectsToYjs(canvas, objectsMapRef.current, isApplyingRemoteUpdateRef.current);
+              }
               canvas.renderAll();
             }
             isInitializedRef.current = true;
@@ -432,16 +351,13 @@ const CanvasComponent: React.FC<CanvasComponentProps> = ({ width, height }) => {
 
     return () => {
       isMounted = false;
-      if (saveTimeoutRef.current) {
-        clearTimeout(saveTimeoutRef.current);
-      }
       if (canvasRef.current) {
         canvasRef.current.dispose();
         canvasRef.current = null;
       }
       window.removeEventListener('resize', handleResize);
     };
-  }, [width, height, setupEventListeners, ensureObjectId, syncObjectToYjs]);
+  }, [width, height, setupEventListeners, canvasData]);
 
 
 
